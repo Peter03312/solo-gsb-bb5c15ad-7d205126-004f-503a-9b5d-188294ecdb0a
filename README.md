@@ -67,6 +67,7 @@
 | 交接确认结算顺序 | 确认临界区先做确定性到点开封与开封请求到期判定：资料若已开封则拒绝交接；否则进行中的开封请求置 `invalidated`（过截止时刻的按原规则置 `expired`）并删除全部旧同意，再转移封存人身份；见证名单、正文、摘要不变 |
 | 交接后权限 | 原封存人立即失去该资料的查看/操作权限（统一 403，不区分资料是否存在）；新封存人可重新申请开封，新请求从 0 票开始；开封前任何接口与错误体都不含正文 |
 | 邀请生命周期 | `pending` 邀请可撤回（`revoked`）或逾期（`expired`，后台扫描与每个交接写事务都会确定性判定）；已撤回/逾期/资料开封后均不可确认；撤回或逾期后封存人可重新邀请；资料开封会连带使待确认邀请失效 |
+| 交接截止以取锁时刻为准 | 受让人确认与封存人撤回都在 `BEGIN IMMEDIATE` 取锁（并锁内复核密钥）**之后**才取当前时刻判定截止，仍按顺序先结算到点开封→到期清除→开封请求到期→邀请逾期：等待写锁期间越过确认截止时刻的，邀请先置 `expired` 并留逾期审计（随事务提交）再沿用 `409`——确认不转移身份/不因交接失效旧请求/不发交接通知，撤回不改成 `revoked`，`resolved_at` 与审计时刻反映实际结算时刻；截止前取锁仍按原规则完成；与到期扫描并发只有一个终态；失效密钥先返回既有 `401`、非受让人/不存在邀请沿用既有 `403`，错误响应不泄露正文 |
 | 到期清除正文 | 封存人凭密钥提交带时区的未来清除时刻（`PUT /documents/{id}/purge`），到期前可改期（再次 `PUT`）或取消（`DELETE`）；只有当前封存人可操作，交接后清除安排保留并改由新封存人管理 |
 | 到期必清除 | 到点无论扫描器是否准时运行，后续查询与操作都呈现已清除结果：后台扫描器、每个写事务与资料查询都先做确定性到点清除判定——清空正文（库中 `body` 置空）、状态置 `purged`、保留摘要/参与方/审计元数据、任何接口不再返回正文；`purged_at` 记为约定的清除时刻 |
 | 清除的连带结算 | 已开封资料仍按期清除；未开封资料清除时：进行中开封请求置 `invalidated`（过截止时刻的按原规则 `expired`）并删除全部旧同意、待确认交接邀请置 `expired` |
@@ -378,9 +379,24 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST $BASE/open-requests/7/approve 
 - **已撤回、已逾期、已确认的邀请不能确认**；资料在邀请期间开封的，邀请连带
   失效（`expired`），同样不能确认。逾期判定既由后台扫描器执行，也在每个交接
   写事务内确定性再做一次，不依赖扫描及时性。
-- 确认在同一写临界区内按顺序结算：
-  1. 确定性处理到点开封与开封请求到期；
-  2. 资料若**已开封**（含临界区内刚触发的到点开封）则拒绝交接（`409`），身份不变；
+- **截止判定以取得写锁后的实际时刻为准**：受让人确认与封存人撤回都可能在
+  截止前到达、却在 `BEGIN IMMEDIATE` 写锁队列中等待期间越过确认截止时刻。
+  两个写接口都在取锁（并先在锁内复核当前密钥）**之后**才取“当前时刻”，并
+  仍按现有顺序先结算：
+  1. 到点开封（`resolve_due_waiting`）；
+  2. 到期清除（`purge_due_documents`）；
+  3. 开封请求到期（过截止的 pending 请求置 `expired`）；
+  4. 交接邀请逾期。
+
+  等待写锁期间越过截止的：届时尚待确认且已到截止的邀请先置 `expired`、
+  留下逾期审计（随该事务提交），确认/撤回再沿用 `409` 拒绝——确认**不转移
+  封存人身份、不因交接使旧开封请求失效（不删旧同意）、不发送交接通知**，
+  撤回**不把逾期邀请改成 `revoked`**；`resolved_at` 与审计时刻一律反映实际
+  结算时刻（晚于截止）。截止前取得写锁的确认/撤回仍按原规则完成；与到期
+  扫描器并发时共用同一把写锁，只有一个终态。
+- 截止前取得写锁的确认在同一写临界区内按顺序结算：
+  1. 确定性处理到点开封、到期清除与本资料开封请求到期；
+  2. 资料若**已开封/已清除**（含临界区内刚触发的到点开封、到期清除）则拒绝交接（`409`），身份不变；
   3. 否则把进行中的开封请求置为 `invalidated`（若其已过截止时刻则按原规则
      `expired`），并**删除其全部旧同意**（旧同意永久失效，不能用于后续请求）；
   4. 转移封存人身份；**见证名单、正文、摘要均不变**。
@@ -440,6 +456,58 @@ curl -sS -X POST $BASE/handover-invitations/1/revoke -H "X-API-Key: $OWNER_KEY"
 #   受让人未注册/为本人/为见证人 400；确认截止时刻已过 400；时间不带时区 422；
 #   非封存人发起/撤回 403；非受让人确认 403；无/错密钥 401；
 #   重复发起待确认邀请 409；确认已撤回/逾期/已确认邀请 409；资料已开封 409。
+```
+
+**本轮调用示例：截止判定以取得写锁后的实际时刻为准。**
+
+当数据库写锁繁忙（其他写事务或到期扫描正在提交）时，确认/撤回请求会在
+`BEGIN IMMEDIATE` 队列中等待；若等待期间越过了确认截止时刻，服务在取锁后
+先完成到点结算，再以实际时刻判定截止——逾期邀请置 `expired`，确认与撤回
+均沿用 `409`，身份不转移、不发交接通知、撤回不改写状态。下面用一份“短
+截止”邀请复现同一判定路径（写锁在取锁瞬间取得，结论与排队越期完全一致）：
+
+```bash
+# 发起一份 2 秒后截止的交接邀请
+SHORT=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=2)).isoformat())")
+curl -sS -X POST $BASE/documents/1/handover-invitations \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d "{\"to_username\":\"erin\",\"confirm_deadline\":\"$SHORT\"}"
+# -> {"invitation_id":2,"status":"pending",...,"confirm_deadline":"…+00:00"}
+
+# 越过截止时刻后受让人确认：临界区先把邀请置 expired（随事务提交）再 409，
+# 不转移封存人身份、不因交接失效旧开封请求、不发送 handover_confirmed 通知
+sleep 2.2
+curl -sS -i -X POST $BASE/handover-invitations/2/confirm -H "X-API-Key: $ERIN_KEY"
+# HTTP/1.1 409 Conflict
+# {"detail":"交接邀请已逾期，不能确认（请封存人重新邀请）"}
+curl -sS $BASE/handover-invitations/2 -H "X-API-Key: $ERIN_KEY"
+# -> {"status":"expired","resolved_at":"<取得写锁后的实际时刻，晚于截止>",...}
+
+# 越过截止时刻后封存人撤回：同样先逾期落库再 409，不会改成 revoked
+curl -sS -i -X POST $BASE/handover-invitations/2/revoke -H "X-API-Key: $OWNER_KEY"
+# HTTP/1.1 409 Conflict
+# {"detail":"交接邀请已逾期，不能撤回（可重新邀请）"}
+
+# 与到期扫描并发时只有一个终态：逾期审计恰好一条
+curl -sS $BASE/documents/1/audit -H "X-API-Key: $OWNER_KEY" |
+  python3 -c "import sys,json;print([r['action'] for r in json.load(sys.stdin)['records']])"
+# -> [..., 'handover_invited', 'handover_invitation_expired']
+
+# 失效/轮换后的旧密钥仍先返回既有 401（认证阶段即拒绝，不触发逾期结算、不留业务审计）
+curl -sS -i -X POST $BASE/handover-invitations/2/confirm -H "X-API-Key: deadbeef"
+# HTTP/1.1 401 Unauthorized   {"detail":"凭据无效"}
+
+# 非受让人（发起人/见证人/无关账号）或不存在的邀请沿用既有 403，错误响应不泄露正文
+curl -sS -i -X POST $BASE/handover-invitations/2/confirm -H "X-API-Key: $OWNER_KEY"
+# HTTP/1.1 403 Forbidden     {"detail":"只有受让人本人可以确认交接"}
+
+# 截止前取锁的确认/撤回仍按原规则完成（200 转移身份 / 200 置 revoked）
+DEADLINE=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).isoformat())")
+curl -sS -X POST $BASE/documents/1/handover-invitations \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d "{\"to_username\":\"erin\",\"confirm_deadline\":\"$DEADLINE\"}"
+curl -sS -X POST $BASE/handover-invitations/3/confirm -H "X-API-Key: $ERIN_KEY"
+# -> {"status":"confirmed","current_owner":"erin","previous_owner":"alice",...}
 ```
 
 ### 到期清除正文（scheduled purge）

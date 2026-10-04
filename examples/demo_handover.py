@@ -5,13 +5,16 @@
 1) 发起交接邀请：受让人已注册、非封存人、非当前见证人；每份资料至多一份
    待确认邀请；
 2) 撤回邀请后受让人不能确认，撤回后可重新邀请；
-3) 逾期邀请不能确认，逾期后可重新邀请；
+3) 逾期邀请不能确认也不能撤回，逾期后可重新邀请；截止判定以取得写锁后的
+   实际时刻为准——即便请求在截止前已到达、在写锁队列中等待期间越过截止，
+   服务也先置 expired 并留逾期审计再沿用 409（不转移身份、不发交接通知、
+   撤回不改成 revoked）；
 4) 确认交接：进行中的开封请求与其旧同意失效（invalidated），封存人身份
    转移，见证名单/正文/摘要不变；原封存人立即失去权限，新封存人重新申请
    开封并由原见证人两票开封；
 5) 邀请待确认期间资料被两票开封：邀请随之失效、不能确认；
 6) 常见拒绝：受让人未注册/是封存人/是见证人、截止时刻已过、非受让人确认、
-   非封存人撤回、重复邀请，均不改状态且不泄露正文。
+   非封存人撤回、重复邀请、失效密钥 401，均不改状态且不泄露正文。
 
 用法: python examples/demo_handover.py [base_url]
 """
@@ -106,14 +109,33 @@ def main() -> None:
     inv_short = resp["invitation_id"]
 
     # ------------------------------------------------------------------
-    # 场景 2：逾期不能确认，逾期后可重新邀请（后台扫描器默认每秒处理）
+    # 场景 2：逾期不能确认也不能撤回，可重新邀请（后台扫描器默认每秒处理）
+    #
+    # 截止判定以“取得写锁后的实际时刻”为准：这里让截止时刻自然流逝，等价于
+    # 请求在截止前到达、却在 BEGIN IMMEDIATE 写锁队列中等待到截止之后。
     # ------------------------------------------------------------------
-    print("== 场景 2：邀请逾期后不能确认，可重新邀请 ==")
+    print("== 场景 2：邀请逾期后确认/撤回均被拒，终态 expired，可重新邀请 ==")
     time.sleep(2.5)
     status, resp = call("POST", f"/handover-invitations/{inv_short}/confirm", erin)
     show("逾期确认", status, resp)
     assert status == 409
-    assert call("GET", f"/handover-invitations/{inv_short}", erin)[1]["status"] == "expired"
+    assert resp["detail"] == "交接邀请已逾期，不能确认（请封存人重新邀请）"
+    # 封存人逾期撤回：沿用 409，邀请不会被改成 revoked
+    status, resp = call("POST", f"/handover-invitations/{inv_short}/revoke", alice)
+    show("逾期撤回", status, resp)
+    assert status == 409
+    assert resp["detail"] == "交接邀请已逾期，不能撤回（可重新邀请）"
+    status, got = call("GET", f"/handover-invitations/{inv_short}", erin)
+    assert got["status"] == "expired"
+    assert got["resolved_at"] >= got["confirm_deadline"]  # 处理时刻反映实际结算时刻
+    # 身份未转移、没有交接通知
+    assert call("GET", f"/documents/{doc1}", alice)[0] == 200
+    _, notes = call("GET", "/notifications", erin)
+    assert all(n["event_type"] != "handover_confirmed" for n in notes["notifications"])
+    # 失效密钥仍先返回既有 401（不触发结算、错误体不泄露正文）
+    assert call("POST", f"/handover-invitations/{inv_short}/confirm", "deadbeef")[0] == 401
+    # 非受让人确认沿用既有 403
+    assert call("POST", f"/handover-invitations/{inv_short}/confirm", alice)[0] == 403
     status, resp = invite(alice, doc1, "h-erin")
     assert status == 201 and resp["status"] == "pending"
     inv2 = resp["invitation_id"]

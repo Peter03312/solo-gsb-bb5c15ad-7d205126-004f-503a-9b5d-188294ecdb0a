@@ -21,10 +21,19 @@
   待确认（pending）且未过期邀请（部分唯一索引兜底）；封存人可撤回待确认邀请；
   受让人须在截止前凭本人 X-API-Key 确认，已撤回/逾期/已确认均不可确认，
   逾期或撤回后封存人可重新邀请；
-- 确认交接时先结算“到点开封 + 请求到期”：资料若已开封则拒绝交接；否则把
-  进行中的开封请求置为 invalidated 并删除其全部旧同意（旧同意永久失效），
-  再把封存人身份转移给受让人；见证名单、正文与摘要均不变；原封存人随即
-  失去该资料的查看与操作权限，新封存人可重新申请开封；
+- 受让人确认与封存人撤回的截止判定一律以取得写锁后的实际时刻为准：请求在
+  截止前到达、但在 BEGIN IMMEDIATE 写锁队列中等待期间越过确认截止时刻的，
+  临界区仍先按现有顺序结算到点开封、到期清除、开封请求到期，再把届时尚待
+  确认且已到截止的邀请置 expired、留下逾期审计（随事务提交），随后沿用 409
+  拒绝——确认不转移封存人身份、不因交接使旧开封请求失效或发送交接通知，
+  撤回不把逾期邀请改成 revoked；处理时刻（resolved_at、审计时刻）一律反映
+  实际结算时刻。截止前取得写锁的确认/撤回仍按原规则完成；与到期扫描器并发
+  只允许一个终态；
+- 确认交接时先按顺序结算“到点开封、到期清除、开封请求到期”：资料若已开封
+  （或已清除）则拒绝交接；否则把进行中的开封请求置为 invalidated 并删除其
+  全部旧同意（旧同意永久失效），再把封存人身份转移给受让人；见证名单、
+  正文与摘要均不变；原封存人随即失去该资料的查看与操作权限，新封存人可
+  重新申请开封；
 - 交接邀请的发起/撤回/确认与开封请求的同意/撤销/替换/定时处理共用同一把
   写锁，全部按 BEGIN IMMEDIATE 已提交顺序产生唯一结果；成功交接与请求失效
   均追加审计；后台扫描器同时处理开封请求到期与交接邀请逾期；
@@ -618,6 +627,45 @@ def settle_due_purges_for_read(
             purge_due_documents(tx, utc_str(now_utc()))
 
 
+def expire_due_open_requests(
+    tx: sqlite3.Connection, now: str, document_id: int | None = None
+) -> list[sqlite3.Row]:
+    """在已持有的写事务内把已过截止时刻仍 pending 的开封请求确定性置为 expired。
+
+    到点开封与到期清除之后、交接邀请截止判定之前调用：与 settle_all_due 中
+    “开封请求到期”这一步完全同一规则。只做状态结算，不删除旧同意——旧同意
+    的删除仍由随后真正消费该请求的路径负责（如交接确认）。返回本次到期的
+    请求行（按 id 升序）；document_id 给定时只结算该资料。
+    """
+    if document_id is not None:
+        rows = tx.execute(
+            "SELECT id, document_id FROM open_requests"
+            " WHERE document_id = ? AND status = 'pending' AND deadline <= ?"
+            " ORDER BY id",
+            (document_id, now),
+        ).fetchall()
+    else:
+        rows = tx.execute(
+            "SELECT id, document_id FROM open_requests"
+            " WHERE status = 'pending' AND deadline <= ? ORDER BY id",
+            (now,),
+        ).fetchall()
+    for row in rows:
+        tx.execute(
+            "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
+            (now, row["id"]),
+        )
+        add_audit(
+            tx,
+            actor_id=None,
+            action="request_expired",
+            document_id=row["document_id"],
+            request_id=row["id"],
+            detail="开封请求到期前未取得两名不同见证人同意，请求失效，已有同意作废",
+        )
+    return rows
+
+
 def expire_due_invitations(tx: sqlite3.Connection, now: str, invitation_id: int | None = None) -> int:
     """在已持有的写事务内把已过确认截止时刻仍 pending 的交接邀请确定性置为 expired。
 
@@ -696,29 +744,12 @@ def settle_all_due(tx: sqlite3.Connection, now: str) -> int:
     # 旧同意与待确认交接邀请在 purge_document_now 内一并结算。
     purge_due_documents(tx, now)
     # 第三步：到截止时刻仍未集齐两票（pending）的请求失效。
-    rows = tx.execute(
-        "SELECT id, document_id FROM open_requests"
-        " WHERE status = 'pending' AND deadline <= ?",
-        (now,),
-    ).fetchall()
-    for row in rows:
-        tx.execute(
-            "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
-            (now, row["id"]),
-        )
-        add_audit(
-            tx,
-            actor_id=None,
-            action="request_expired",
-            document_id=row["document_id"],
-            request_id=row["id"],
-            detail="开封请求到期前未取得两名不同见证人同意，请求失效，已有同意作废",
-        )
+    expired_requests = expire_due_open_requests(tx, now)
     # 第四步：过确认截止时刻仍待确认的交接邀请失效（逾期后可重新邀请）。
     expire_due_invitations(tx, now)
     # 第五步：过确认截止时刻仍待确认的预封存提案失效并清空提案正文。
     expire_due_pre_seal_proposals(tx, now)
-    return len(rows)
+    return len(expired_requests)
 
 
 # ---------------------------------------------------------------------------
@@ -2491,12 +2522,23 @@ def replace_witness(
 # 同时至多一份待确认且未过期的邀请（DB 部分唯一索引 + 事务内预检双保险）。
 # 封存人可撤回待确认邀请；受让人须在截止前凭本人 X-API-Key 确认。
 #
-# 确认结算顺序（全部在同一写临界区内）：
-#   1) 确定性到点开封（resolve_due_waiting）与开封请求到期判定；
-#   2) 资料已开封 -> 拒绝交接（开封若为本临界区触发则先提交再报错）；
-#   3) 把进行中的开封请求置为 invalidated，并删除其全部旧同意（永久失效）；
-#   4) 转移 documents.owner_id；见证名单、正文、摘要一律不变；
-#   5) 原封存人失去该资料查看/操作权限，新封存人可重新申请开封。
+# 确认/撤回的截止判定以取得写锁后的实际时刻为准：请求可能在截止前到达，却
+# 在 BEGIN IMMEDIATE 写锁队列中等待期间越过确认截止时刻。两个写接口都在
+# 取锁（并先在锁内复核当前密钥）之后才取“当前时刻”，并仍按现有顺序先结算
+#   1) 确定性到点开封（resolve_due_waiting）；
+#   2) 到期清除（purge_due_documents）；
+#   3) 开封请求到期（expire_due_open_requests）；
+#   4) 交接邀请逾期（expire_due_invitations）。
+# 等待写锁期间越过截止的：邀请先置 expired 并留下逾期审计（随事务提交），
+# 确认/撤回再沿用 409 拒绝——确认不转移身份、不因交接失效旧请求、不发交接
+# 通知，撤回不把逾期邀请改成 revoked；所有处理时刻均为锁后实际时刻。与到期
+# 扫描器并发时共用同一把写锁，只有一个终态。
+#
+# 截止前取得写锁的确认在同一写临界区内继续：
+#   1) 资料已开封 -> 拒绝交接（开封若为本临界区触发则先提交再报错）；
+#   2) 把进行中的开封请求置为 invalidated，并删除其全部旧同意（永久失效）；
+#   3) 转移 documents.owner_id；见证名单、正文、摘要一律不变；
+#   4) 原封存人失去该资料查看/操作权限，新封存人可重新申请开封。
 # 已撤回/逾期/已确认/资料已开封的邀请一律不能确认；逾期或撤回后可重新邀请。
 # 开封前任何响应（含全部错误体）都不返回正文。
 # ---------------------------------------------------------------------------
@@ -2637,16 +2679,37 @@ def revoke_handover_invitation(
     db: sqlite3.Connection = Depends(get_db),
     user: AuthUser = Depends(current_user),
 ) -> dict[str, Any]:
+    """封存人撤回待确认的交接邀请。
+
+    截止判定以取得写锁后的实际时刻为准：请求在截止前到达、但在 BEGIN
+    IMMEDIATE 写锁队列中等待期间越过确认截止时刻的，临界区仍先按现有顺序
+    结算到点开封、到期清除、开封请求到期与交接邀请逾期——邀请置 expired
+    并留下逾期审计（随事务提交），随后沿用 409 拒绝，绝不能把逾期邀请改成
+    revoked；撤回的 resolved_at/审计时刻也一律取锁后实际时刻。
+    """
     _load_invitation_for_owner(db, invitation_id, user)
 
-    now = utc_str(now_utc())
     # 与同意/撤销开封请求相同：若开封/清除在本临界区内被确定性触发，
     # 状态变更先提交，撤回失败在提交后再返回。
     post_commit_error: HTTPException | None = None
     invitation: dict[str, Any] | None = None
     with authed_write_tx(db, user) as tx:
+        # 截止判定以取得写锁（并锁内复核密钥）后的实际时刻为准：
+        # now 绝不能在取锁前取得，否则等待写锁期间越过截止时刻的撤回
+        # 会错误地把逾期邀请改成 revoked 并把处理时刻记在截止前。
+        now = utc_str(now_utc())
+        # 先取资料编号（只读，不产生写入），把“开封请求到期”结算限定在本资料，
+        # 与既有写路径的写入范围保持一致（不借撤回顺带结算其他资料）。
+        pre_inv = tx.execute(
+            "SELECT document_id FROM handover_invitations WHERE id = ?",
+            (invitation_id,),
+        ).fetchone()
+        # 仍按现有顺序先结算：到点开封 -> 到期清除 -> 开封请求到期。
         resolve_due_waiting(tx, now)
         purge_due_documents(tx, now)
+        if pre_inv is not None:
+            expire_due_open_requests(tx, now, pre_inv["document_id"])
+        # 再判定本邀请是否已过确认截止时刻（逾期先落库，撤回失败提交后返回）。
         expired_here = expire_due_invitations(tx, now, invitation_id) > 0
 
         inv = tx.execute(
@@ -2701,7 +2764,13 @@ def confirm_handover(
 ) -> dict[str, Any]:
     """受让人凭本人 X-API-Key 在截止前确认交接。
 
-    成功后返回邀请状态、当前封存人、当前见证名单与旧开封请求结果；
+    截止判定以取得写锁后的实际时刻为准：请求在截止前到达、但在 BEGIN
+    IMMEDIATE 写锁队列中等待期间越过确认截止时刻的，临界区仍先按现有顺序
+    结算到点开封、到期清除、开封请求到期与交接邀请逾期——届时尚待确认且已
+    到截止的邀请置 expired、留下逾期审计（随事务提交），随后沿用 409 拒绝：
+    不转移封存人身份、不因交接使旧开封请求失效、不发送交接通知，所有处理
+    时刻一律取锁后实际时刻。与到期扫描器并发时两者共用同一把写锁，只有一个
+    终态。成功后返回邀请状态、当前封存人、当前见证名单与旧开封请求结果；
     任何拒绝路径都不转移身份、不泄露正文。
     """
     pre = db.execute(
@@ -2713,13 +2782,32 @@ def confirm_handover(
         # 发起方、见证人、无关账号一律不可确认，且不区分邀请是否存在
         raise err(403, "只有受让人本人可以确认交接")
 
-    now = utc_str(now_utc())
     post_commit_error: HTTPException | None = None
     response: dict[str, Any] | None = None
     with authed_write_tx(db, user) as tx:
-        # 结算顺序第 1 步：到点开封 / 到期清除 / 邀请逾期全部确定性落库。
+        # 截止判定以取得写锁（并锁内复核密钥）后的实际时刻为准：
+        # now 绝不能在取锁前取得，否则等待写锁期间越过确认截止时刻的确认
+        # 会错误转移封存人身份，并把处理时刻记在截止前。
+        now = utc_str(now_utc())
+
+        # 先取资料编号（只读），把“开封请求到期”结算限定在本资料：与改动前
+        # 确认路径只失效本资料旧请求的写入范围一致，不借确认顺带结算其他资料。
+        pre_inv = tx.execute(
+            "SELECT document_id FROM handover_invitations WHERE id = ?",
+            (invitation_id,),
+        ).fetchone()
+
+        # 仍按现有顺序先结算，再判定本邀请截止：
+        # 第 1 步：到点开封（开封会连带使待确认邀请失效，必须先落库）。
         resolve_due_waiting(tx, now)
+        # 第 2 步：到期清除（清除同样连带使进行中请求/待确认邀请失效）。
         purge_due_documents(tx, now)
+        # 第 3 步：本资料已过截止时刻仍 pending 的开封请求按原规则确定性失效。
+        expired_rows = (
+            expire_due_open_requests(tx, now, pre_inv["document_id"])
+            if pre_inv is not None else []
+        )
+        # 第 4 步：过确认截止时刻仍待确认的交接邀请（含本邀请）逾期落库。
         expire_due_invitations(tx, now)
 
         inv = tx.execute(
@@ -2733,33 +2821,21 @@ def confirm_handover(
         if doc is None:
             # 防御性：邀请引用的资料不存在，与无权沿用同一 403
             raise err(403, "无权操作该邀请或邀请不存在")
+        if inv["to_user_id"] != user["id"]:
+            raise err(403, "只有受让人本人可以确认交接")
 
-        # 先锁定当前进行中（pending/waiting）的开封请求（若有），后续结算以它为准。
+        # 结算后该资料“最近一个进行中/刚到期”的开封请求：上面第 3 步已把
+        # 过截止的 pending 请求置 expired（其旧同意随后在交接分支删除）。
         active = tx.execute(
             "SELECT * FROM open_requests"
             " WHERE document_id = ? AND status IN ('pending', 'waiting')"
             " ORDER BY id DESC LIMIT 1",
             (doc["id"],),
         ).fetchone()
+        # 第 3 步只结算本资料：这里至多一条；防御性取编号最大者（与
+        # “ORDER BY id DESC LIMIT 1”一致）。
+        expired_here = expired_rows[-1] if expired_rows else None
 
-        # 与提交开封请求/替换见证人路径一致：已过截止时刻仍 pending 的
-        # 旧请求先按原规则确定性失效（其同意随后面的交接结算一并删除）。
-        if active is not None and active["status"] == "pending" and active["deadline"] <= now:
-            tx.execute(
-                "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
-                (now, active["id"]),
-            )
-            add_audit(
-                tx,
-                actor_id=None,
-                action="request_expired",
-                document_id=doc["id"],
-                request_id=active["id"],
-                detail="确认交接时确认开封请求已过截止时刻，请求按原规则失效，已有同意作废",
-            )
-
-        if inv["to_user_id"] != user["id"]:
-            raise err(403, "只有受让人本人可以确认交接")
         if doc["status"] != "sealed":
             # 开封/清除（含本临界区刚触发的到点判定）后拒绝交接；状态变更必须先随
             # 本事务提交，故错误延迟到提交后再返回（与同意/替换路径一致）。
@@ -2768,43 +2844,48 @@ def confirm_handover(
             else:
                 post_commit_error = err(409, "资料已开封，交接被拒绝")
         elif inv["status"] == "expired":
-            # 本临界区刚判定逾期也要先提交，故延迟到提交后再报错
+            # 本临界区刚判定逾期（等待写锁期间越过截止的情形也在此）也要先提交，
+            # 故延迟到提交后再报错；不转移身份、不失效旧请求、不发交接通知。
             post_commit_error = err(409, "交接邀请已逾期，不能确认（请封存人重新邀请）")
         elif inv["status"] == "revoked":
             raise err(409, "交接邀请已撤回，不能确认")
         elif inv["status"] == "confirmed":
             raise err(409, "交接邀请已确认")
-        elif inv["confirm_deadline"] <= now:
-            # 锁内兜底：即便上面的统一逾期处理未命中（理论上不会），也绝不超期确认
-            post_commit_error = err(409, "已过确认截止时刻，不能确认")
         else:
-            # 结算顺序第 2 步：进行中的开封请求失效（过截止的上面已置 expired），
-            # 旧同意删除。
+            # 结算顺序第 5 步：进行中的开封请求失效（第 3 步已到期的为 expired），
+            # 旧同意删除。注意：走到这里本邀请必然仍 pending 且未过截止——逾期
+            # 分支已在上面提交并拒绝，交接绝不会因超期确认而使旧请求失效。
             old_request_info: dict[str, Any] | None = None
-            if active is not None:
-                if active["deadline"] <= now:
-                    # 上面已按原规则把过截止时刻的 pending 请求置 expired
-                    old_status = "expired"
-                else:
-                    tx.execute(
-                        "UPDATE open_requests SET status='invalidated', resolved_at=? WHERE id=?",
-                        (now, active["id"]),
-                    )
-                    add_audit(
-                        tx,
-                        actor_id=user["id"],
-                        action="request_invalidated",
-                        document_id=doc["id"],
-                        request_id=active["id"],
-                        detail="封存人交接确认：进行中的开封请求失效，其全部旧同意作废，新封存人可重新申请开封",
-                    )
-                    old_status = "invalidated"
+            if expired_here is not None:
+                # 第 3 步已按原规则把过截止时刻的 pending 请求置 expired
+                old_status = "expired"
+                tx.execute(
+                    "DELETE FROM approvals WHERE request_id = ?", (expired_here["id"],)
+                )
+                old_request_info = {
+                    "request_id": expired_here["id"],
+                    "status": old_status,
+                    "approval_count": 0,
+                }
+            elif active is not None:
+                tx.execute(
+                    "UPDATE open_requests SET status='invalidated', resolved_at=? WHERE id=?",
+                    (now, active["id"]),
+                )
+                add_audit(
+                    tx,
+                    actor_id=user["id"],
+                    action="request_invalidated",
+                    document_id=doc["id"],
+                    request_id=active["id"],
+                    detail="封存人交接确认：进行中的开封请求失效，其全部旧同意作废，新封存人可重新申请开封",
+                )
                 tx.execute(
                     "DELETE FROM approvals WHERE request_id = ?", (active["id"],)
                 )
                 old_request_info = {
                     "request_id": active["id"],
-                    "status": old_status,
+                    "status": "invalidated",
                     "approval_count": 0,
                 }
 
@@ -2823,7 +2904,7 @@ def confirm_handover(
             ).fetchone()
             old_owner = old_owner_row["username"]
 
-            # 结算顺序第 3 步：转移封存人身份；名单、正文、摘要不变。
+            # 结算顺序第 6 步：转移封存人身份；名单、正文、摘要不变。
             tx.execute(
                 "UPDATE documents SET owner_id = ? WHERE id = ?",
                 (user["id"], doc["id"]),
@@ -2844,7 +2925,7 @@ def confirm_handover(
             )
             # 收件人在身份转移的同一事务内固定：新封存人（受让人）、旧封存人
             # 与当前三名见证人。转移后 participant_ids 取到新封存人 + 见证人，
-            # 并集补上旧封存人编号。
+            # 并集补上旧封存人编号。逾期拒绝路径不发送任何交接通知。
             recipients = participant_ids(tx, doc["id"], user["id"]) | {old_owner_row["id"]}
             fanout_notifications(
                 tx,
