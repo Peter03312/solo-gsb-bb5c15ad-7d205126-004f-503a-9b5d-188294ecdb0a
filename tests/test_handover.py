@@ -13,9 +13,18 @@
   响应（含错误体）不得泄露正文；
 - 成功操作返回邀请状态；确认还返回当前封存人与旧请求结果；
 - 无权或无效邀请一律拒绝且不泄露资料；成功交接与请求失效均留审计；
-- 并发确认/撤回/见证同意/定时处理按已提交顺序产生唯一结果。
+- 并发确认/撤回/见证同意/定时处理按已提交顺序产生唯一结果；
+- 截止判定以取得写锁后的实际时刻为准：确认/撤回在截止前到达、等待
+  BEGIN IMMEDIATE 写锁期间越过确认截止时刻的，邀请先置 expired、留下
+  逾期审计并沿用 409——确认不转移身份、不因交接失效旧请求或发送交接
+  通知，撤回不把逾期邀请改成 revoked；处理时间（resolved_at）反映实际
+  结算时刻，不早于写锁释放时刻；截止前取得写锁的仍按原规则完成操作。
 """
+import contextlib
 import datetime as dt
+import os
+import sqlite3
+import threading
 import time
 
 import pytest
@@ -694,3 +703,364 @@ def test_concurrent_confirm_vs_second_approval_single_outcome(tmp_path, monkeypa
     finally:
         server.should_exit = True
         thread.join(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# 截止判定以取得写锁后的实际时刻为准（等待写锁期间越过确认截止时刻）
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def held_write_lock():
+    """在测试进程内占用同一数据库文件的写锁，模拟“请求已到达、等待写锁”窗口。
+
+    占用期间发起的交接写请求阻塞在 BEGIN IMMEDIATE；释放写锁后，被阻塞的
+    请求必须以“取得写锁后的实际时刻”做截止判定，而不是用请求到达时刻。
+    """
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"], timeout=30.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@pytest.fixture
+def no_sweeper_handover(monkeypatch):
+    """停用后台扫描器：确保越过确认截止时刻的结算由被测请求自身在取锁后完成。"""
+    from app.main import ExpirySweeper
+
+    monkeypatch.setattr(ExpirySweeper, "sweep_once", staticmethod(lambda: 0))
+    time.sleep(0.2)  # 让进行中的扫描收尾（测试扫描间隔 0.05s）
+
+
+def _raw_handover_db():
+    conn = sqlite3.connect(os.environ["SEAL_DB_PATH"])
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def test_confirm_waiting_past_deadline_expires_without_transfer(
+    client, no_sweeper_handover
+):
+    """确认在截止前发起、取得写锁时截止已过：先置 expired、留逾期审计，
+    再沿用 409；不转移身份、不因交接失效旧请求、不发送交接通知。"""
+    keys, doc_id, dg = _setup(client)
+    inv_id = client.post(
+        f"/documents/{doc_id}/handover-invitations",
+        json={"to_username": "new", "confirm_deadline": _in_seconds(1.2)},
+        headers=auth(keys["owner"]),
+    ).json()["invitation_id"]
+    # 旧封存人名下有一个进行中开封请求（1 票）：逾期确认不得因交接使其失效
+    req = _create_request(client, keys["owner"], doc_id, deadline_h=2)
+    _approve(client, keys["w1"], req, dg)
+
+    outcome = {}
+
+    def late_confirm():
+        r = _confirm(client, keys["new"], inv_id)
+        outcome["status"] = r.status_code
+        outcome["detail"] = r.json().get("detail")
+        outcome["body"] = r.text
+
+    with held_write_lock():
+        t = threading.Thread(target=late_confirm)
+        t.start()
+        time.sleep(1.6)  # 确认等待写锁期间越过 1.2s 的确认截止时刻
+        release_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+    t.join(10)
+
+    assert outcome["status"] == 409
+    assert outcome["detail"] == "交接邀请已逾期，不能确认（请封存人重新邀请）"
+    assert BODY not in outcome["body"]
+
+    # 邀请终态 expired，resolved_at 反映实际结算时刻（不早于写锁释放/截止时刻）
+    inv = _get_inv(client, keys["new"], inv_id).json()
+    assert inv["status"] == "expired"
+    assert inv["resolved_at"] is not None
+    assert inv["resolved_at"] >= release_at
+
+    # 封存人身份未转移：原封存人仍可操作，受让人仍无权
+    assert client.get(f"/documents/{doc_id}", headers=auth(keys["owner"])).status_code == 200
+    assert client.get(f"/documents/{doc_id}", headers=auth(keys["new"])).status_code == 403
+
+    conn = _raw_handover_db()
+    try:
+        owner = conn.execute("SELECT owner_id FROM documents WHERE id=?", (doc_id,)).fetchone()[0]
+        old_id = conn.execute("SELECT id FROM users WHERE username='owner'").fetchone()[0]
+        new_id = conn.execute("SELECT id FROM users WHERE username='new'").fetchone()[0]
+        assert owner == old_id and owner != new_id
+        # 旧请求未因交接失效、旧票保留（未走交接的 invalidated 路径）
+        assert conn.execute(
+            "SELECT status FROM open_requests WHERE id=?", (req,)
+        ).fetchone()[0] == "pending"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM approvals WHERE request_id=?", (req,)
+        ).fetchone()[0] == 1
+        rows = conn.execute(
+            "SELECT action FROM audit_log WHERE document_id=? ORDER BY id", (doc_id,)
+        ).fetchall()
+        actions = [r["action"] for r in rows]
+        assert actions.count("handover_invitation_expired") == 1
+        assert "handover_confirmed" not in actions
+        assert "request_invalidated" not in actions
+        # 逾期审计/邀请 resolved_at 均不早于写锁释放时刻
+        expired_at = conn.execute(
+            "SELECT at FROM audit_log WHERE document_id=? AND action='handover_invitation_expired'",
+            (doc_id,),
+        ).fetchone()[0]
+        assert expired_at >= release_at
+        # 不发送交接通知
+        assert conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE event_type='handover_confirmed'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # 逾期后封存人可重新邀请；受让人二次确认仍 409
+    assert _confirm(client, keys["new"], inv_id).status_code == 409
+    r = client.post(
+        f"/documents/{doc_id}/handover-invitations",
+        json={"to_username": "new", "confirm_deadline": _in_hours(1)},
+        headers=auth(keys["owner"]),
+    )
+    assert r.status_code == 201
+
+
+def test_revoke_waiting_past_deadline_expires_instead_of_revoked(
+    client, no_sweeper_handover
+):
+    """撤回在截止前发起、取得写锁时截止已过：先置 expired、留逾期审计，
+    再沿用 409；不得把逾期邀请改成 revoked。"""
+    keys, doc_id, _ = _setup(client)
+    inv_id = client.post(
+        f"/documents/{doc_id}/handover-invitations",
+        json={"to_username": "new", "confirm_deadline": _in_seconds(1.2)},
+        headers=auth(keys["owner"]),
+    ).json()["invitation_id"]
+
+    outcome = {}
+
+    def late_revoke():
+        r = _revoke(client, keys["owner"], inv_id)
+        outcome["status"] = r.status_code
+        outcome["detail"] = r.json().get("detail")
+
+    with held_write_lock():
+        t = threading.Thread(target=late_revoke)
+        t.start()
+        time.sleep(1.6)  # 撤回等待写锁期间越过 1.2s 的确认截止时刻
+        release_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+    t.join(10)
+
+    assert outcome["status"] == 409
+    assert outcome["detail"] == "交接邀请已逾期，不能撤回（可重新邀请）"
+
+    inv = _get_inv(client, keys["owner"], inv_id).json()
+    assert inv["status"] == "expired"
+    assert inv["resolved_at"] >= release_at
+
+    conn = _raw_handover_db()
+    try:
+        actions = [r["action"] for r in conn.execute(
+            "SELECT action FROM audit_log WHERE document_id=? ORDER BY id", (doc_id,)
+        ).fetchall()]
+        assert actions.count("handover_invitation_expired") == 1
+        assert "handover_revoked" not in actions
+        assert "handover_confirmed" not in actions
+    finally:
+        conn.close()
+
+
+def test_confirm_waiting_past_deadline_settles_due_open_first(
+    client, no_sweeper_handover
+):
+    """取锁时同时越过邀请截止与旧开封请求截止：仍按现有顺序先把旧请求结算为
+    expired（开封请求到期先于邀请逾期判定），邀请再 expired 并 409，不转移身份。"""
+    keys, doc_id, dg = _setup(client)
+    inv_id = client.post(
+        f"/documents/{doc_id}/handover-invitations",
+        json={"to_username": "new", "confirm_deadline": _in_seconds(1.2)},
+        headers=auth(keys["owner"]),
+    ).json()["invitation_id"]
+    req = client.post(
+        f"/documents/{doc_id}/open-requests",
+        json={"reason": "同时越过两个截止", "deadline": _in_seconds(1.0)},
+        headers=auth(keys["owner"]),
+    ).json()["request_id"]
+    _approve(client, keys["w1"], req, dg)
+
+    outcome = {}
+
+    def late_confirm():
+        r = _confirm(client, keys["new"], inv_id)
+        outcome["status"] = r.status_code
+
+    with held_write_lock():
+        t = threading.Thread(target=late_confirm)
+        t.start()
+        time.sleep(1.6)  # 同时越过 1.0s 请求截止与 1.2s 邀请截止
+    t.join(10)
+
+    assert outcome["status"] == 409
+    conn = _raw_handover_db()
+    try:
+        assert conn.execute(
+            "SELECT status FROM open_requests WHERE id=?", (req,)
+        ).fetchone()[0] == "expired"
+        assert conn.execute(
+            "SELECT status FROM handover_invitations WHERE id=?", (inv_id,)
+        ).fetchone()[0] == "expired"
+        actions = [r["action"] for r in conn.execute(
+            "SELECT action FROM audit_log WHERE document_id=? ORDER BY id", (doc_id,)
+        ).fetchall()]
+        assert actions.index("request_expired") < actions.index("handover_invitation_expired")
+        assert "request_invalidated" not in actions
+        assert "handover_confirmed" not in actions
+        # 结算到期的旧请求不删除历史同意；邀请逾期同样不删除
+        assert conn.execute(
+            "SELECT COUNT(*) FROM approvals WHERE request_id=?", (req,)
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_confirm_and_revoke_waiting_past_deadline_single_terminal(
+    client, no_sweeper_handover
+):
+    """确认与撤回都在截止前到达、一同排队等待写锁，取锁时均已过截止：
+    与到期扫描并发也只允许一个终态——恰好一条 expired、一条逾期审计。"""
+    from app.main import ExpirySweeper
+
+    keys, doc_id, _ = _setup(client)
+    inv_id = client.post(
+        f"/documents/{doc_id}/handover-invitations",
+        json={"to_username": "new", "confirm_deadline": _in_seconds(1.2)},
+        headers=auth(keys["owner"]),
+    ).json()["invitation_id"]
+
+    results = {}
+
+    def late_confirm():
+        r = _confirm(client, keys["new"], inv_id)
+        results["confirm"] = r.status_code
+
+    def late_revoke():
+        r = _revoke(client, keys["owner"], inv_id)
+        results["revoke"] = r.status_code
+
+    with held_write_lock():
+        t1 = threading.Thread(target=late_confirm)
+        t2 = threading.Thread(target=late_revoke)
+        t1.start()
+        t2.start()
+        time.sleep(1.6)  # 两个请求都在锁队列中越过截止时刻
+        # 写锁释放前再插入一轮扫描：扫描同样排队，取锁时也已过截止
+        sweep_thread = threading.Thread(target=ExpirySweeper.sweep_once)
+        sweep_thread.start()
+    t1.join(10)
+    t2.join(10)
+    sweep_thread.join(10)
+
+    assert results == {"confirm": 409, "revoke": 409}
+    assert _get_inv(client, keys["owner"], inv_id).json()["status"] == "expired"
+    conn = _raw_handover_db()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM handover_invitations WHERE id=? AND status='expired'",
+            (inv_id,),
+        ).fetchone()[0] == 1
+        actions = [r["action"] for r in conn.execute(
+            "SELECT action FROM audit_log WHERE document_id=? ORDER BY id", (doc_id,)
+        ).fetchall()]
+        assert actions.count("handover_invitation_expired") == 1
+        assert "handover_confirmed" not in actions
+        assert "handover_revoked" not in actions
+    finally:
+        conn.close()
+
+
+def test_confirm_lock_acquired_before_deadline_still_confirms(
+    client, no_sweeper_handover
+):
+    """截止前取得写锁的确认仍按原规则完成交接；处理时刻不早于写锁释放时刻。"""
+    keys, doc_id, dg = _setup(client)
+    inv_id = client.post(
+        f"/documents/{doc_id}/handover-invitations",
+        json={"to_username": "new", "confirm_deadline": _in_seconds(5)},
+        headers=auth(keys["owner"]),
+    ).json()["invitation_id"]
+    req = _create_request(client, keys["owner"], doc_id, deadline_h=2)
+    _approve(client, keys["w1"], req, dg)
+
+    outcome = {}
+
+    def do_confirm():
+        r = _confirm(client, keys["new"], inv_id)
+        outcome["status"] = r.status_code
+        outcome["json"] = r.json() if r.status_code == 200 else None
+
+    with held_write_lock():
+        t = threading.Thread(target=do_confirm)
+        t.start()
+        time.sleep(0.5)  # 写锁在截止前释放，确认取锁时截止未过
+        release_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds")
+    t.join(10)
+
+    assert outcome["status"] == 200
+    data = outcome["json"]
+    assert data["status"] == "confirmed"
+    assert data["current_owner"] == "new" and data["previous_owner"] == "owner"
+    assert data["resolved_at"] >= release_at
+    assert data["old_open_request"] == {
+        "request_id": req, "status": "invalidated", "approval_count": 0
+    }
+    # 身份确已转移、原封存人立即失权
+    assert client.get(f"/documents/{doc_id}", headers=auth(keys["owner"])).status_code == 403
+    assert client.get(f"/documents/{doc_id}", headers=auth(keys["new"])).status_code == 200
+
+
+def test_past_deadline_confirm_invalid_key_still_401(client, no_sweeper_handover):
+    """失效密钥即使在邀请已逾期时确认，也先返回既有 401（认证先于结算），
+    且不留下任何业务审计/状态变更。"""
+    keys, doc_id, _ = _setup(client)
+    inv_id = client.post(
+        f"/documents/{doc_id}/handover-invitations",
+        json={"to_username": "new", "confirm_deadline": _in_seconds(1.0)},
+        headers=auth(keys["owner"]),
+    ).json()["invitation_id"]
+    time.sleep(1.2)
+
+    outcome = {}
+
+    def late_confirm():
+        r = client.post(
+            f"/handover-invitations/{inv_id}/confirm", headers=auth("deadbeefdeadbeef")
+        )
+        outcome["status"] = r.status_code
+        outcome["detail"] = r.json().get("detail")
+
+    with held_write_lock():
+        t = threading.Thread(target=late_confirm)
+        t.start()
+        time.sleep(0.5)
+    t.join(10)
+
+    assert outcome["status"] == 401 and outcome["detail"] == "凭据无效"
+    # 失效密钥路径不推进结算：扫描器停用时邀请仍 pending（由后续合法请求/扫描结算）
+    assert _get_inv(client, keys["owner"], inv_id).json()["status"] == "pending"
+    conn = _raw_handover_db()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE document_id=? AND action='handover_invitation_expired'",
+            (doc_id,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # 受让人本人的非受让人/不存在邀请语义沿用既有 403（错误体不含正文）
+    r = _confirm(client, keys["owner"], inv_id)
+    assert r.status_code == 403 and BODY not in r.text
+    r = _confirm(client, keys["new"], 99999)
+    assert r.status_code == 403 and BODY not in r.text

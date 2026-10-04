@@ -11,13 +11,24 @@
    开封并由原见证人两票开封；
 5) 邀请待确认期间资料被两票开封：邀请随之失效、不能确认；
 6) 常见拒绝：受让人未注册/是封存人/是见证人、截止时刻已过、非受让人确认、
-   非封存人撤回、重复邀请，均不改状态且不泄露正文。
+   非封存人撤回、重复邀请，均不改状态且不泄露正文；
+7) 截止判定以取得写锁后的实际时刻为准：确认/撤回在截止前到达、等待
+   BEGIN IMMEDIATE 写锁期间越过确认截止时刻的，取锁后先完成到点开封/清除/
+   请求到期结算，再把邀请置 expired、留逾期审计并沿用 409——确认不转移
+   身份、不因交接失效旧请求、不发交接通知，撤回不把逾期邀请改成 revoked，
+   处理时间反映实际结算时刻；截止前取得写锁的仍正常完成。该场景需演示进程
+   能直接访问同一 SQLite 文件（SEAL_DB_PATH，本地/compose 同机运行），
+   无法访问库文件时自动跳过（HTTP 层的逾期确认见场景 2）。
 
 用法: python examples/demo_handover.py [base_url]
 """
+import contextlib
 import datetime as dt
 import json
+import os
+import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -54,6 +65,21 @@ def show(title: str, status: int, body) -> None:
 def invite(owner, doc_id, to_name, deadline=None):
     return call("POST", f"/documents/{doc_id}/handover-invitations", owner,
                 {"to_username": to_name, "confirm_deadline": deadline or in_hours(1)})
+
+
+@contextlib.contextmanager
+def held_write_lock():
+    """占用同一 SQLite 文件的写锁（BEGIN IMMEDIATE），模拟写锁排队窗口。
+
+    仅适用于演示进程与服务共用同一台机器上的库文件（SEAL_DB_PATH）。
+    """
+    conn = sqlite3.connect(os.environ.get("SEAL_DB_PATH", "/data/seal.db"), timeout=30.0)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield
+    finally:
+        conn.rollback()
+        conn.close()
 
 
 def main() -> None:
@@ -186,6 +212,95 @@ def main() -> None:
     assert call("GET", f"/handover-invitations/{inv4}", erin)[1]["status"] == "expired"
     assert call("POST", f"/handover-invitations/{inv4}/confirm", erin)[0] == 409
     assert invite(alice, doc3, "h-erin")[0] == 409   # 已开封不能再发起交接
+
+    # ------------------------------------------------------------------
+    # 场景 5：等锁越过确认截止时刻（截止以取得写锁后的实际时刻为准）
+    # ------------------------------------------------------------------
+    db_path = os.environ.get("SEAL_DB_PATH", "/data/seal.db")
+    if not os.path.exists(db_path):
+        print(f"== 场景 5：跳过（无法访问同一库文件 {db_path}；"
+              "HTTP 层逾期确认见场景 2）==")
+    else:
+        print("== 场景 5：确认/撤回排队越过截止时刻 -> 逾期 409，不转移身份 ==")
+        _, sealed = call("POST", "/documents", alice,
+                         {"body": "交接示例正文 4：LOCK-WAIT",
+                          "witnesses": ["h-bob", "h-carol", "h-dave"]})
+        doc5, digest5 = sealed["document_id"], sealed["digest"]
+        inv5 = invite(alice, doc5, "h-erin", in_seconds(2))[1]["invitation_id"]
+        old_req = call("POST", f"/documents/{doc5}/open-requests", alice,
+                       {"reason": "等锁赛跑", "deadline": in_hours(24)})[1]["request_id"]
+        call("POST", f"/open-requests/{old_req}/approve", bob, {"digest": digest5})
+
+        outcome = {}
+
+        def late_confirm():
+            outcome["confirm"] = call(
+                "POST", f"/handover-invitations/{inv5}/confirm", erin)
+
+        def late_revoke():
+            outcome["revoke"] = call(
+                "POST", f"/handover-invitations/{inv5}/revoke", alice)
+
+        # 持锁 3 秒（> 2s 截止）：确认/撤回在锁队列中越过截止时刻，取锁后按
+        # 实际时刻判定。扫描器每秒一轮，同样在队列里——终态仍只有一个。
+        with held_write_lock():
+            t1 = threading.Thread(target=late_confirm)
+            t2 = threading.Thread(target=late_revoke)
+            t1.start()
+            t2.start()
+            time.sleep(3)
+        t1.join(10)
+        t2.join(10)
+        cf_status, cf_body = outcome["confirm"]
+        rv_status, rv_body = outcome["revoke"]
+        show("取锁后确认（已逾期）", cf_status, cf_body)
+        show("取锁后撤回（已逾期）", rv_status, rv_body)
+        assert cf_status == 409 and rv_status == 409
+        assert "已逾期" in cf_body["detail"] and "已逾期" in rv_body["detail"]
+        assert "交接示例正文" not in json.dumps(cf_body)
+
+        got = call("GET", f"/handover-invitations/{inv5}", erin)[1]
+        show("邀请终态", 200, got)
+        assert got["status"] == "expired" and got["resolved_at"] is not None
+        # resolved_at 不早于确认截止时刻（实际结算时刻，而非请求到达时刻）
+        assert got["resolved_at"] >= got["confirm_deadline"]
+        # 身份未转移：alice 仍是封存人，erin 仍无权
+        assert call("GET", f"/documents/{doc5}", alice)[0] == 200
+        assert call("GET", f"/documents/{doc5}", erin)[0] == 403
+        # 旧请求未因交接失效（仍 pending，旧票保留）
+        _, doc5_view = call("GET", f"/documents/{doc5}", alice)
+        assert doc5_view["latest_open_request"]["status"] == "pending"
+        records = call("GET", f"/documents/{doc5}/audit", alice)[1]["records"]
+        actions = [r["action"] for r in records]
+        assert actions.count("handover_invitation_expired") == 1
+        assert "handover_confirmed" not in actions
+        assert "handover_revoked" not in actions
+        assert "request_invalidated" not in actions
+        # 逾期后可重新邀请
+        assert invite(alice, doc5, "h-erin")[0] == 201
+
+        # 截止前取得写锁的确认仍按原规则完成（用一份 5s 截止的新邀请验证）
+        _, sealed = call("POST", "/documents", alice,
+                         {"body": "交接示例正文 5：IN-TIME",
+                          "witnesses": ["h-bob", "h-carol", "h-dave"]})
+        doc6 = sealed["document_id"]
+        inv6 = invite(alice, doc6, "h-erin", in_seconds(5))[1]["invitation_id"]
+        result6 = {}
+
+        def in_time_confirm():
+            result6["r"] = call("POST", f"/handover-invitations/{inv6}/confirm", erin)
+
+        with held_write_lock():
+            t = threading.Thread(target=in_time_confirm)
+            t.start()
+            time.sleep(0.5)  # 锁在截止前释放，取锁时仍未到截止
+        t.join(10)
+        status6, body6 = result6["r"]
+        show("截止前取锁的确认", status6, body6)
+        assert status6 == 200 and body6["status"] == "confirmed"
+        assert body6["current_owner"] == "h-erin"
+        assert call("GET", f"/documents/{doc6}", alice)[0] == 403
+        assert call("GET", f"/documents/{doc6}", erin)[0] == 200
 
     print("\n全部交接示例断言通过。资料 2 的审计动作：")
     _, audit = call("GET", f"/documents/{doc2}/audit", erin)

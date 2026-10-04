@@ -64,7 +64,8 @@
 | 替换不破坏进行中请求 | 被替换者对本次请求的同意立即失效、其他同意保留；有效票不足两票时请求由 `waiting` 退回 `pending`，新见证人凭封存摘要补票；已到最早开封时刻且两票已齐则先开封并拒绝替换；过截止时刻的请求按原规则失效后再完成替换 |
 | 撤销/到期作废 | 到点**之前**封存人可撤销；过截止时刻始终不足两票则置为 `revoked`/`expired`，其同意永久失效；新请求从 0 票开始 |
 | 未开封可交接封存人 | 封存人可就未开封资料向另一已注册本地账号发起交接邀请（受让人不能是本人或当前见证人），填写带时区确认截止时刻；每份资料同时至多一份待确认且未过期邀请；封存人可撤回；受让人须在截止前凭本人密钥确认 |
-| 交接确认结算顺序 | 确认临界区先做确定性到点开封与开封请求到期判定：资料若已开封则拒绝交接；否则进行中的开封请求置 `invalidated`（过截止时刻的按原规则置 `expired`）并删除全部旧同意，再转移封存人身份；见证名单、正文、摘要不变 |
+| 交接确认结算顺序 | 确认临界区先按与扫描器相同顺序做确定性结算（到点开封 → 到期清除 → 开封请求到期 → 交接邀请逾期）：资料若已开封则拒绝交接；否则进行中的开封请求置 `invalidated`（过截止时刻的按原规则置 `expired`）并删除全部旧同意，再转移封存人身份；见证名单、正文、摘要不变 |
+| 交接截止以取锁时刻为准 | 受让人确认、封存人撤回的截止判定一律以**取得 `BEGIN IMMEDIATE` 写锁后的实际时刻**为准：请求在截止前到达、排队等锁期间越过确认截止时刻的，取锁后仍先按现有顺序完成到点开封/清除/请求到期结算，再把届时尚待确认且已到截止的邀请置 `expired`、留下逾期审计并沿用 `409`（逾期终态先提交）；确认**不转移身份、不因交接使旧请求失效或发送交接通知**，撤回**不把逾期邀请改成 `revoked`**；`resolved_at` 与审计时刻均为实际结算时刻（不早于取锁时刻）；截止前取得写锁的仍按原规则完成；与到期扫描并发只允许一个终态 |
 | 交接后权限 | 原封存人立即失去该资料的查看/操作权限（统一 403，不区分资料是否存在）；新封存人可重新申请开封，新请求从 0 票开始；开封前任何接口与错误体都不含正文 |
 | 邀请生命周期 | `pending` 邀请可撤回（`revoked`）或逾期（`expired`，后台扫描与每个交接写事务都会确定性判定）；已撤回/逾期/资料开封后均不可确认；撤回或逾期后封存人可重新邀请；资料开封会连带使待确认邀请失效 |
 | 到期清除正文 | 封存人凭密钥提交带时区的未来清除时刻（`PUT /documents/{id}/purge`），到期前可改期（再次 `PUT`）或取消（`DELETE`）；只有当前封存人可操作，交接后清除安排保留并改由新封存人管理 |
@@ -378,6 +379,16 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST $BASE/open-requests/7/approve 
 - **已撤回、已逾期、已确认的邀请不能确认**；资料在邀请期间开封的，邀请连带
   失效（`expired`），同样不能确认。逾期判定既由后台扫描器执行，也在每个交接
   写事务内确定性再做一次，不依赖扫描及时性。
+- **截止判定以取得写锁后的实际时刻为准**：确认（受让人凭本人 X-API-Key）与
+  撤回（封存人）都可能在确认截止前到达、却因数据库写锁排队（`BEGIN IMMEDIATE`）
+  在等待期间越过截止时刻。两者进入临界区后都以**取锁后的实际时刻**作为
+  `now`，仍按现有顺序先结算**到点开封、到期清除、开封请求到期**，再处理
+  交接邀请：届时尚待确认且已到截止的邀请确定性置 `expired`、留下逾期审计
+  （`handover_invitation_expired`，时刻为实际结算时刻）并沿用 `409` 拒绝，
+  逾期终态随本事务先提交。逾期确认**不转移封存人身份、不因交接使旧开封请求
+  失效、不发送交接通知**；逾期撤回**不把邀请改成 `revoked`**。截止前取得
+  写锁的请求仍按原规则完成（确认转移、撤回撤销），处理时间不早于取锁时刻。
+  与后台到期扫描并发时，条件更新保证同一邀请只有一个终态、恰好一条逾期审计。
 - 确认在同一写临界区内按顺序结算：
   1. 确定性处理到点开封与开封请求到期；
   2. 资料若**已开封**（含临界区内刚触发的到点开封）则拒绝交接（`409`），身份不变；
@@ -435,6 +446,37 @@ curl -sS -X POST $BASE/documents/1/open-requests \
 # 撤回待确认邀请（封存人）；撤回/逾期后均返回 409 不能确认，可重新邀请
 curl -sS -X POST $BASE/handover-invitations/1/revoke -H "X-API-Key: $OWNER_KEY"
 # -> {"invitation_id":1,"status":"revoked",...}
+
+# 等锁越过截止时刻（本轮缺陷场景）：确认/撤回都以“取得写锁后的实际时刻”判定。
+# 发起一份 2 秒后截止的邀请：
+SHORT=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=2)).isoformat())")
+INV=$(curl -sS -X POST $BASE/documents/1/handover-invitations \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d "{\"to_username\":\"erin\",\"confirm_deadline\":\"$SHORT\"}" | python3 -c "import sys,json;print(json.load(sys.stdin)['invitation_id'])")
+# 用另一个连接占用数据库写锁至越过截止时刻（模拟写锁排队；生产上即并发写事务）：
+python3 - <<'PY'
+import os, sqlite3, time
+db = os.environ.get("SEAL_DB_PATH", "/data/seal.db")
+conn = sqlite3.connect(db, timeout=30)
+conn.execute("BEGIN IMMEDIATE")
+time.sleep(3)          # 持锁期间，下面的确认/撤回排队等待并越过确认截止时刻
+conn.rollback(); conn.close()
+PY &
+sleep 0.5
+# 确认请求在截止前已发出，取锁时截止已过 -> 409；身份不转移、旧请求不因交接失效、
+# 无交接通知，邀请 resolved_at/逾期审计均为取锁后的实际结算时刻：
+curl -sS -X POST $BASE/handover-invitations/$INV/confirm -H "X-API-Key: $ERIN_KEY"
+# -> {"detail":"交接邀请已逾期，不能确认（请封存人重新邀请）"}  (HTTP 409)
+# 封存人同期撤回同样 409，逾期邀请不会被改成 revoked：
+curl -sS -X POST $BASE/handover-invitations/$INV/revoke -H "X-API-Key: $OWNER_KEY"
+# -> {"detail":"交接邀请已逾期，不能撤回（可重新邀请）"}  (HTTP 409)
+curl -sS $BASE/handover-invitations/$INV -H "X-API-Key: $ERIN_KEY"
+# -> {"status":"expired","resolved_at":"<取锁后的实际时刻>",...}
+# 失效密钥仍先返回既有 401（不触发结算、不留审计）；非受让人确认/不存在邀请沿用 403：
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST $BASE/handover-invitations/$INV/confirm -H "X-API-Key: deadbeef"
+# -> 401
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST $BASE/handover-invitations/$INV/confirm -H "X-API-Key: $OWNER_KEY"
+# -> 403
 
 # 拒绝示例（均不改状态、不转移身份、不泄露正文）：
 #   受让人未注册/为本人/为见证人 400；确认截止时刻已过 400；时间不带时区 422；
@@ -1228,7 +1270,12 @@ python -m pytest -q
 清零、过截止旧请求按原规则 `expired`、`waiting` 请求随交接失效且不开封、到点两票
 已齐先开封并拒绝交接、资料开封连带邀请失效、交接结果冷读库一致，以及真实 uvicorn +
 多线程的**并发确认 vs 撤回、并发确认 vs 第二票同意赛跑**（两种终态互斥且唯一，
-成功交接与请求失效均留审计）；
+成功交接与请求失效均留审计），以及**截止判定以取得写锁后的实际时刻为准**
+（占用写锁越过确认截止时刻：受让人确认先按到点开封/清除/请求到期顺序结算、
+邀请置 expired 留逾期审计再 409，不转移身份、不失效旧请求、不发交接通知；
+封存人撤回先逾期再 409，不把邀请改成 revoked；`resolved_at`/审计时刻不早于
+取锁时刻；截止前取锁仍正常完成；确认/撤回/到期扫描三方排队只产生一个终态、
+恰好一条逾期审计；失效密钥仍 401 不触发结算、非受让人/不存在邀请仍 403）；
 最后含到期清除：安排/改期/取消与权限校验（仅当前封存人、时刻带时区且在未来）、
 扫描器到点清除与无扫描器时查询/写事务的确定性清除、清除后任何接口不返回正文且
 库中正文已清空、未开封资料清除连带（进行中请求 `invalidated`、旧同意删除、待确认
